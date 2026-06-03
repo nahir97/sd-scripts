@@ -103,7 +103,13 @@ def load_anima_model(
 
     # load model weights with dynamic fp8 optimization and LoRA merging if needed
     logger.info(f"Loading DiT model from {dit_path}, device={loading_device}")
-    rename_hooks = WeightTransformHooks(rename_hook=lambda k: k[len("net.") :] if k.startswith("net.") else k)
+    def _rename_anima_key(k: str) -> str:
+        for prefix in ("net.", "model.diffusion_model."):
+            if k.startswith(prefix):
+                return k[len(prefix) :]
+        return k
+
+    rename_hooks = WeightTransformHooks(rename_hook=_rename_anima_key)
     sd = load_safetensors_with_lora_and_fp8(
         model_files=dit_path,
         lora_weights_list=lora_weights_list,
