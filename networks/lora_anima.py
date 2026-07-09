@@ -222,6 +222,255 @@ class LoRAInfModule(LoRAModule):
         return self.default_forward(x)
 
 
+class DoRAModule(LoRAModule):
+    """
+    DoRA (Weight-Decomposed Low-Rank Adaptation) module.
+
+    Decomposes the LoRA update into magnitude and direction:
+        W' = m * (V / ||V||_c)   where V = W + BA
+    - m is a learnable magnitude vector (initialized to ||W||_c)
+    - BA is the standard LoRA update
+    - ||·||_c is the column-wise L2 norm
+
+    Reference: "DoRA: Weight-Decomposed Low-Rank Adaptation" (Liu et al., 2024)
+    """
+
+    def __init__(
+        self,
+        lora_name,
+        org_module: torch.nn.Module,
+        multiplier=1.0,
+        lora_dim=4,
+        alpha=1,
+        dropout=None,
+        rank_dropout=None,
+        module_dropout=None,
+    ):
+        super().__init__(lora_name, org_module, multiplier, lora_dim, alpha, dropout, rank_dropout, module_dropout)
+
+        # Save Conv2d metadata before the module is deleted by apply_to
+        if isinstance(org_module, torch.nn.Conv2d):
+            self.conv_stride = org_module.stride
+            self.conv_padding = org_module.padding
+            self.conv_dilation = org_module.dilation
+            self.conv_groups = org_module.groups
+
+        # Initialize dora_scale = column-wise norm of pretrained weight
+        with torch.no_grad():
+            w = org_module.weight.to(torch.float)
+            if isinstance(org_module, torch.nn.Conv2d):
+                # [out_c, in_c, kh, kw] → norm over (in_c * kh * kw)
+                dora_scale_init = torch.norm(w.view(w.shape[0], -1), dim=1, keepdim=False)
+            else:
+                # Linear [out_dim, in_dim] → norm of each output row
+                dora_scale_init = torch.norm(w, dim=1, keepdim=False)
+
+        self.dora_scale = torch.nn.Parameter(dora_scale_init, requires_grad=True)
+
+    def apply_to(self):
+        """Override apply_to to keep weight reference for DoRA decomposition."""
+        self.org_forward = self.org_module.forward
+        self.org_module.forward = self.forward
+        # Keep references to original weight/bias — needed because DoRA
+        # operates in weight space (W + BA merge), not output space.
+        self.org_module_weight = self.org_module.weight
+        self.org_module_bias = self.org_module.bias if hasattr(self.org_module, 'bias') else None
+        del self.org_module
+
+    def _get_delta_weight(self, multiplier=None):
+        """Compute the LoRA delta weight = (up @ down) * scale * multiplier."""
+        if multiplier is None:
+            multiplier = self.multiplier
+
+        down_weight = self.lora_down.weight.to(torch.float)
+        up_weight = self.lora_up.weight.to(torch.float)
+
+        if len(down_weight.size()) == 2:
+            # Linear
+            delta = (up_weight @ down_weight) * self.scale * multiplier
+        elif down_weight.size()[2:4] == (1, 1):
+            # Conv2d 1×1
+            delta = (
+                (up_weight.squeeze(3).squeeze(2) @ down_weight.squeeze(3).squeeze(2))
+                .unsqueeze(2).unsqueeze(3)
+                * self.scale * multiplier
+            )
+        else:
+            # Conv2d 3×3
+            delta = (
+                torch.nn.functional.conv2d(down_weight.permute(1, 0, 2, 3), up_weight)
+                .permute(1, 0, 2, 3)
+                * self.scale * multiplier
+            )
+        return delta
+
+    def forward(self, x):
+        # Module dropout — skip DoRA entirely
+        if self.module_dropout is not None and self.training:
+            if torch.rand(1) < self.module_dropout:
+                return self.org_forward(x)
+
+        weight = self.org_module_weight.to(torch.float)
+        delta_w = self._get_delta_weight().to(weight.device)
+
+        # Merge direction:  W ← W + BA
+        weight_dir = weight + delta_w
+
+        # Column-wise L2 norm
+        # Per DoRA §4.3, the norm is detached so that only the direction
+        # (not its scale) receives gradients, matching the intended
+        # magnitude–direction decomposition.
+        with torch.no_grad():
+            if len(weight_dir.shape) == 2:  # Linear
+                weight_norm = torch.norm(weight_dir, dim=1, keepdim=True)
+            else:  # Conv2d  [out_c, in_c, kh, kw]
+                weight_norm = torch.norm(weight_dir.view(weight_dir.shape[0], -1), dim=1, keepdim=True)
+                weight_norm = weight_norm.view(-1, 1, 1, 1)
+
+        # Normalise direction
+        weight_normalized = weight_dir / (weight_norm + 1e-8)
+
+        # Apply learned magnitude  (broadcast over input dims)
+        if len(weight_dir.shape) == 2:
+            weight_effective = self.dora_scale.unsqueeze(1) * weight_normalized
+        else:
+            weight_effective = self.dora_scale.view(-1, 1, 1, 1) * weight_normalized
+
+        weight_effective = weight_effective.to(self.org_module_weight.dtype)
+
+        if len(weight_dir.shape) == 2:
+            return torch.nn.functional.linear(x, weight_effective, self.org_module_bias)
+        else:
+            return torch.nn.functional.conv2d(
+                x, weight_effective, self.org_module_bias,
+                self.conv_stride, self.conv_padding, self.conv_dilation, self.conv_groups,
+            )
+
+    def _dora_weight_to_sd(self, sd):
+        """Helper: return dora_scale from state dict or from self."""
+        return sd.get("dora_scale", self.dora_scale)
+
+
+class DoRAInfModule(LoRAInfModule, DoRAModule):
+    """
+    DoRA module for inference / merging.
+    Dual-inherit from LoRAInfModule (for merge_to / get_weight /
+    regional forward plumbing) and DoRAModule (for dora_scale).
+    """
+
+    def __init__(
+        self,
+        lora_name,
+        org_module: torch.nn.Module,
+        multiplier=1.0,
+        lora_dim=4,
+        alpha=1,
+        **kwargs,
+    ):
+        # No dropout for inference; call LoRAModule init directly to
+        # avoid the DoRAModule chain (we inject dora_scale manually).
+        LoRAModule.__init__(self, lora_name, org_module, multiplier, lora_dim, alpha)
+
+        # Save Conv2d metadata
+        if isinstance(org_module, torch.nn.Conv2d):
+            self.conv_stride = org_module.stride
+            self.conv_padding = org_module.padding
+            self.conv_dilation = org_module.dilation
+            self.conv_groups = org_module.groups
+
+        # Infer dora_scale from weight init
+        with torch.no_grad():
+            w = org_module.weight.to(torch.float)
+            if isinstance(org_module, torch.nn.Conv2d):
+                dora_scale_init = torch.norm(w.view(w.shape[0], -1), dim=1, keepdim=False)
+            else:
+                dora_scale_init = torch.norm(w, dim=1, keepdim=False)
+        self.dora_scale = torch.nn.Parameter(dora_scale_init, requires_grad=False)
+
+        self.org_module_ref = [org_module]
+        self.enabled = True
+        self.network: LoRANetwork = None
+
+    def set_network(self, network):
+        self.network = network
+
+    def apply_to(self):
+        """Keep weight reference for DoRA, then register as submodule."""
+        self.org_forward = self.org_module.forward
+        self.org_module.forward = self.forward
+        self.org_module_weight = self.org_module.weight
+        self.org_module_bias = self.org_module.bias if hasattr(self.org_module, 'bias') else None
+        del self.org_module
+
+    def merge_to(self, sd, dtype, device):
+        """Merge DoRA weights into the original module."""
+        org_sd = self.org_module.state_dict()
+        weight = org_sd["weight"]
+        org_dtype = weight.dtype
+        org_device = weight.device
+
+        if dtype is None:
+            dtype = org_dtype
+        if device is None:
+            device = org_device
+
+        down_weight = sd["lora_down.weight"].to(torch.float).to(device)
+        up_weight = sd["lora_up.weight"].to(torch.float).to(device)
+        weight = weight.to(torch.float).to(device)
+
+        # Compute LoRA delta
+        if len(weight.size()) == 2:
+            delta_w = (up_weight @ down_weight) * self.scale * self.multiplier
+        elif down_weight.size()[2:4] == (1, 1):
+            delta_w = (
+                (up_weight.squeeze(3).squeeze(2) @ down_weight.squeeze(3).squeeze(2))
+                .unsqueeze(2).unsqueeze(3)
+                * self.scale * self.multiplier
+            )
+        else:
+            conved = torch.nn.functional.conv2d(down_weight.permute(1, 0, 2, 3), up_weight).permute(1, 0, 2, 3)
+            delta_w = conved * self.scale * self.multiplier
+
+        # DoRA: decompose merged weight
+        dora_scale = self._dora_weight_to_sd(sd).to(torch.float).to(device)
+        weight_dir = weight + delta_w
+
+        if len(weight.size()) == 2:
+            weight_norm = torch.norm(weight_dir, dim=1, keepdim=True)
+            weight_normalized = weight_dir / (weight_norm + 1e-8)
+            weight_effective = dora_scale.unsqueeze(1) * weight_normalized
+        else:
+            weight_norm = torch.norm(weight_dir.view(weight.shape[0], -1), dim=1, keepdim=True)
+            weight_normalized = weight_dir / (weight_norm.view(-1, 1, 1, 1) + 1e-8)
+            weight_effective = dora_scale.view(-1, 1, 1, 1) * weight_normalized
+
+        org_sd["weight"] = weight_effective.to(dtype)
+        self.org_module.load_state_dict(org_sd)
+
+    def default_forward(self, x):
+        """DoRA forward for inference (identical to DoRAModule.forward)."""
+        weight = self.org_module_weight.to(torch.float)
+        delta_w = self._get_delta_weight().to(weight.device)
+        weight_dir = weight + delta_w
+
+        # Norm detached per DoRA §4.3 (no-op during inference but kept for consistency)
+        with torch.no_grad():
+            if len(weight_dir.shape) == 2:
+                weight_norm = torch.norm(weight_dir, dim=1, keepdim=True)
+            else:
+                weight_norm = torch.norm(weight_dir.view(weight_dir.shape[0], -1), dim=1, keepdim=True).view(-1, 1, 1, 1)
+
+        if len(weight_dir.shape) == 2:
+            weight_effective = (self.dora_scale.unsqueeze(1) * weight_dir / (weight_norm + 1e-8)).to(self.org_module_weight.dtype)
+            return torch.nn.functional.linear(x, weight_effective, self.org_module_bias)
+        else:
+            weight_effective = (self.dora_scale.view(-1, 1, 1, 1) * weight_dir / (weight_norm + 1e-8)).to(self.org_module_weight.dtype)
+            return torch.nn.functional.conv2d(
+                x, weight_effective, self.org_module_bias,
+                self.conv_stride, self.conv_padding, self.conv_dilation, self.conv_groups,
+            )
+
+
 def create_network(
     multiplier: float,
     network_dim: Optional[int],
@@ -307,6 +556,11 @@ def create_network(
     else:
         reg_dims = None
 
+    # Parse dora flag
+    use_dora = kwargs.get("dora", "false")
+    if use_dora is not None:
+        use_dora = True if use_dora.lower() == "true" else False
+
     network = LoRANetwork(
         text_encoders,
         unet,
@@ -322,6 +576,7 @@ def create_network(
         reg_dims=reg_dims,
         reg_lrs=reg_lrs,
         verbose=verbose,
+        use_dora=use_dora,
     )
 
     loraplus_lr_ratio = kwargs.get("loraplus_lr_ratio", None)
@@ -348,6 +603,7 @@ def create_network_from_weights(multiplier, file, ae, text_encoders, unet, weigh
     modules_dim = {}
     modules_alpha = {}
     train_llm_adapter = False
+    has_dora = False
     for key, value in weights_sd.items():
         if "." not in key:
             continue
@@ -358,11 +614,16 @@ def create_network_from_weights(multiplier, file, ae, text_encoders, unet, weigh
         elif "lora_down" in key:
             dim = value.size()[0]
             modules_dim[lora_name] = dim
+        elif "dora_scale" in key:
+            has_dora = True
 
         if "llm_adapter" in lora_name:
             train_llm_adapter = True
 
-    module_class = LoRAInfModule if for_inference else LoRAModule
+    if for_inference:
+        module_class = DoRAInfModule if has_dora else LoRAInfModule
+    else:
+        module_class = DoRAModule if has_dora else LoRAModule
 
     network = LoRANetwork(
         text_encoders,
@@ -406,6 +667,7 @@ class LoRANetwork(torch.nn.Module):
         reg_dims: Optional[Dict[str, int]] = None,
         reg_lrs: Optional[Dict[str, float]] = None,
         verbose: Optional[bool] = False,
+        use_dora: bool = False,
     ) -> None:
         super().__init__()
         self.multiplier = multiplier
@@ -417,10 +679,15 @@ class LoRANetwork(torch.nn.Module):
         self.train_llm_adapter = train_llm_adapter
         self.reg_dims = reg_dims
         self.reg_lrs = reg_lrs
+        self.use_dora = use_dora
 
         self.loraplus_lr_ratio = None
         self.loraplus_unet_lr_ratio = None
         self.loraplus_text_encoder_lr_ratio = None
+
+        # Override module_class for DoRA when training from scratch
+        if use_dora and modules_dim is None:
+            module_class = DoRAModule
 
         if modules_dim is not None:
             logger.info("create LoRA network from weights")
